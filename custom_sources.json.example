@@ -1,0 +1,39 @@
+{
+  "_comment": "Example configuration for custom sources. Copy to custom_sources.json to customize.",
+  "interested_only": false,
+  "filter_sources": [],
+  "ats_companies": [
+    {
+      "name": "Spotify",
+      "ats": "lever",
+      "token": "spotify",
+      "enabled": true
+    },
+    {
+      "name": "Palantir",
+      "ats": "lever",
+      "token": "palantir",
+      "enabled": true
+    },
+    {
+      "name": "OpenAI",
+      "ats": "greenhouse",
+      "token": "openai",
+      "enabled": true
+    },
+    {
+      "name": "Linear",
+      "ats": "ashby",
+      "token": "linear",
+      "enabled": true
+    }
+  ],
+  "custom_feeds": [
+    {
+      "name": "Sample Custom API",
+      "url": "https://example.com/api/jobs",
+      "type": "json",
+      "enabled": false
+    }
+  ]
+}

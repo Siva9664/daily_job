@@ -1,0 +1,57 @@
+name: Daily Job & Internship Alert
+
+on:
+  # ── Scheduled run ─────────────────────────────────────────
+  # Runs every day at 02:30 UTC (8:00 AM IST, 10:30 PM EDT)
+  # Adjust the cron expression to your preferred time.
+  # Cron syntax: minute hour day month weekday
+  schedule:
+    - cron: "30 2 * * *"
+
+  # ── Manual trigger ────────────────────────────────────────
+  # Allows you to run the workflow manually from the
+  # GitHub Actions tab at any time (great for testing).
+  workflow_dispatch:
+
+jobs:
+  send-alert:
+    name: Fetch Jobs & Send Digest Email
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Check out the repository ───────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Restore seen_jobs.json from cache ──────────────
+      # This preserves deduplication state across runs so the
+      # same jobs are not emailed repeatedly.
+      - name: Restore seen_jobs cache
+        uses: actions/cache@v4
+        with:
+          path: seen_jobs.json
+          key: seen-jobs-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            seen-jobs-${{ runner.os }}-
+
+      # ── 3. Set up Python ──────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ── 4. Install dependencies ───────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 5. Run the alert script ───────────────────────────
+      # Secrets are injected as environment variables.
+      # Set these in your repo → Settings → Secrets → Actions
+      - name: Run job alert
+        env:
+          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+          KEYWORDS:       ${{ secrets.KEYWORDS }}
+        run: python job_alert.py
