@@ -68,17 +68,19 @@ Every day at a scheduled time:
 |---|---|
 | 🌐 **100+ Data Sources** | 100+ direct company ATS portals + 5 public job boards |
 | ⚡ **Fast & Multithreaded** | `ThreadPoolExecutor` queries 100+ sources in ~10–15 seconds |
+| 🕒 **Last-24h Recency** | Prefers fresh listings with a prominent `⚡ Last 24h` email badge |
+| 💼 **Optional LinkedIn** | Fetch past-24h postings via LinkedIn's guest API (`ENABLE_LINKEDIN=true`) |
 | 🎛️ **Custom Sources File** | Add your own dream companies or feeds in `custom_sources.json` |
 | 🎯 **Interested-Only Filter** | Filter alerts to strictly your interested sources or companies |
 | 🎓 **Student-Friendly** | Separate "Internships" section in every email digest |
-| 🧠 **Smart Deduplication** | SHA-256 fingerprinting — no job ever appears twice |
+| 🧠 **Smart Deduplication** | SHA-256 fingerprinting — persistent caching ensures no duplicates across runs |
 | 🎯 **Keyword Filtering** | Only get listings matching your exact skills/interests |
 | 📬 **Multiple Recipients** | Comma-separated — send to as many emails as you want |
 | 💅 **Beautiful HTML Email** | Responsive design with cards, stats bar, badges & buttons |
 | ⏰ **Fully Automated** | GitHub Actions runs it daily — completely free of charge |
 | 🔒 **Secure by Design** | Credentials in `.env` locally; GitHub Secrets in CI |
 | 🛡️ **Fault-Tolerant** | If any ATS or API fails, the rest continue without crashing |
-| 📦 **Minimal Dependencies** | Only 2 pip packages: `requests` + `python-dotenv` |
+| 📦 **Minimal Dependencies** | `requests`, `python-dotenv`, and `beautifulsoup4` |
 | 🐍 **Python 3.9+** | Works on modern Python versions |
 
 ---
@@ -98,9 +100,11 @@ job_alert.py
 ├── load_seen_jobs()          ← Load seen_jobs.json (dedup state)
 │
 ├── fetch_all()               ← ThreadPoolExecutor (max 20 workers)
-│   ├── Public APIs           → Himalayas, Remotive, Jobicy, RemoteOK, Arbeitnow
+│   ├── Public APIs           → Himalayas (Browse & Search), Remotive, Jobicy, RemoteOK, Arbeitnow
+│   ├── LinkedIn (Optional)   → Public guest API (last 24h postings via f_TPR=r86400)
 │   ├── ATS Fetchers          → Greenhouse, Lever, Ashby endpoints
 │   └── Custom Feeds          → Any custom JSON endpoints
+
 │
 ├── matches_keywords()        ← Optional keyword filtering
 ├── job_hash()                ← SHA-256 deduplication
@@ -280,9 +284,11 @@ All configuration is done via environment variables in your `.env` file:
 | `EMAIL_PASSWORD` | ✅ Yes | — | Gmail **App Password** (16 chars, spaces optional) |
 | `EMAIL_TO` | ✅ Yes | — | Comma-separated list of recipient emails |
 | `KEYWORDS` | ❌ No | *(empty = all jobs)* | Filter keywords for title/company/description/tags |
+| `ENABLE_LINKEDIN` | ❌ No | `false` | Fetch past-24h jobs via LinkedIn's guest search API |
 
 > **Important:** All three `EMAIL_*` variables are required. If any are missing, the script
 > will log an error and exit without sending — it will **not** crash silently.
+
 
 ### Internal Tuning Constants
 
@@ -358,6 +364,7 @@ Your credentials must be stored as **encrypted repository secrets** — they are
 | `EMAIL_PASSWORD` | `abcd efgh ijkl mnop` | Your 16-char App Password |
 | `EMAIL_TO` | `you@gmail.com,friend@gmail.com` | Comma-separated recipients |
 | `KEYWORDS` | `python,data,machine learning` | Optional; leave blank for all |
+| `ENABLE_LINKEDIN` | `true` | Optional; enables LinkedIn guest fetcher |
 
 ### Step 3 — Verify the Workflow
 
@@ -378,7 +385,10 @@ To do a **manual test run**:
 | Clear the dedup cache | Repo → Actions → Caches → delete `seen-jobs-*` |
 | Change the schedule | Edit `cron:` in `daily-alert.yml` |
 
-### Workflow File Reference
+### Workflow File Reference & Fixed Cache
+
+> [!NOTE]
+> **Fixed Cache Key:** Previously, the workflow used `github.run_id` in the primary cache key (`seen-jobs-${{ runner.os }}-${{ github.run_id }}`), which generated an entirely new key on every run and caused deduplication state to reset. The cache key has been updated to the stable key `seen-jobs-${{ runner.os }}` with fallback prefix `seen-jobs-`, ensuring `seen_jobs.json` reliably persists across runs.
 
 ```yaml
 name: Daily Job & Internship Alert
@@ -396,18 +406,22 @@ jobs:
       - uses: actions/cache@v4          # Preserves seen_jobs.json between runs
         with:
           path: seen_jobs.json
-          key: seen-jobs-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: seen-jobs-${{ runner.os }}-
+          key: seen-jobs-${{ runner.os }}
+          restore-keys: |
+            seen-jobs-${{ runner.os }}-
+            seen-jobs-
       - uses: actions/setup-python@v5
         with: { python-version: "3.11", cache: pip }
       - run: pip install -r requirements.txt
       - run: python job_alert.py
         env:
-          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
-          KEYWORDS:       ${{ secrets.KEYWORDS }}
+          EMAIL_FROM:      ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD:  ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO:        ${{ secrets.EMAIL_TO }}
+          KEYWORDS:        ${{ secrets.KEYWORDS }}
+          ENABLE_LINKEDIN: ${{ secrets.ENABLE_LINKEDIN || vars.ENABLE_LINKEDIN || 'false' }}
 ```
+
 
 ### Changing the Schedule
 
@@ -425,23 +439,36 @@ Use [crontab.guru](https://crontab.guru) to build your own expression.
 
 ## 🔌 Data Sources & Accuracy
 
-All four sources are **completely free** and require **no API key or account**.
+All default sources are **completely free** and require **no API key or account**.
 
 ### Source Summary
 
-| Source | Endpoint | Auth | Jobs | Internships |
-|---|---|---|---|---|
-| [Himalayas.app](https://himalayas.app/api) | `/api/v1/jobs` | None | ✅ | ✅ via `employment_type=Intern` |
-| [Remotive.com](https://remotive.com/api) | `/api/remote-jobs` | None | ✅ | ✅ via `job_type` field |
-| [Jobicy.com](https://jobicy.com/api) | `/api/v2/remote-jobs` | None | ✅ | ✅ keyword detection |
-| [RemoteOK.com](https://remoteok.com/api) | `/api` | None | ✅ | ✅ keyword detection |
+| Source | Endpoint | Auth | Jobs | Internships | Notes |
+|---|---|---|---|---|---|
+| [Himalayas.app](https://himalayas.app/jobs/api) | `/jobs/api` (Browse) & `/jobs/api/search` (Search) | None | ✅ | ✅ via `employment_type=Intern` | Supports `sort=recent`, salary ranges & recency tags |
+| [Remotive.com](https://remotive.com/api) | `/api/remote-jobs` | None | ✅ | ✅ via `job_type` field | Authoritative tech job postings |
+| [Jobicy.com](https://jobicy.com/api) | `/api/v2/remote-jobs` | None | ✅ | ✅ keyword detection | Includes publication timestamps |
+| [RemoteOK.com](https://remoteok.com/api) | `/api` | None | ✅ | ✅ keyword detection | Rich tags & epoch timestamps |
+| [Arbeitnow.com](https://www.arbeitnow.com/api/job-board-api) | `/api/job-board-api` | None | ✅ | ✅ keyword detection | Visa sponsorship and remote tags |
+| [LinkedIn](https://www.linkedin.com) *(Optional)* | `/jobs-guest/jobs/api/seeMoreJobPostings/search` | None | ✅ | ✅ keyword detection | Requires `ENABLE_LINKEDIN=true` (last 24h via `f_TPR=r86400`) |
 
 ### Per-Source Accuracy Notes
 
 **Himalayas.app** — ✅ Most reliable
-- Curated listings with structured fields (salary, location, categories)
-- Internship detection uses the `employment_type=Intern` **server-side API filter** — very accurate
-- Salary data is often present in USD/year range format
+- Uses official public endpoints: Browse (`/jobs/api`) and Search (`/jobs/api/search`) with `sort=recent`
+- Internships filter uses `employment_type=Intern` and keyword queries — high accuracy
+- Provides publication timestamps (`pubDate`) allowing listings from the last 24h to be badged `⚡ Last 24h`
+- Salary data is parsed into structured `$min–$max / period` format
+
+**LinkedIn (Guest Search — Last 24 Hours)** — ⚠️ Experimental / Optional
+- Enabled by setting `ENABLE_LINKEDIN=true` in `.env` or GitHub Secrets
+- Uses LinkedIn's public guest endpoint: `https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search`
+- Passes `f_TPR=r86400` to filter strictly for opportunities posted within the last 24 hours
+- HTML responses are parsed with `beautifulsoup4`
+- All returned listings receive the `⚡ Last 24h` badge and are sorted to the top of the email
+> [!WARNING]
+> **LinkedIn Disclaimer & ToS Notice:**
+> This LinkedIn fetcher uses an **unofficial public guest endpoint**. It is unsupported by LinkedIn, subject to aggressive rate limits (HTTP 429), and can change or break without notice. Automated scraping may violate [LinkedIn's Terms of Service](https://www.linkedin.com/legal/user-agreement). Use this feature **strictly for personal email alerts at your own risk**. If disabled (`ENABLE_LINKEDIN=false`), the project runs purely on 100% public APIs and official ATS company boards.
 
 **Remotive.com** — ✅ Very reliable for tech roles
 - Well-structured API with a consistent `job_type` response field
@@ -451,25 +478,29 @@ All four sources are **completely free** and require **no API key or account**.
 **Jobicy.com** — ✅ Good coverage
 - Broad category coverage across many industries
 - Internship detection is **keyword-based** (looks for "intern" in the job title)
-- May occasionally miss internships not labelled explicitly in the title
+- Includes publication dates for recency tracking
 
 **RemoteOK.com** — ⚠️ Good but with caveats
 - The API returns a **legal notice as the first element** — the script automatically skips it
 - Internship detection is **keyword-based** (title + tags)
 - Tag data is rich and very useful for keyword filtering
-- Moderate rate limiting: avoid running the script more than once per 10 minutes
+- Includes epoch timestamps for recency detection
+
+**Arbeitnow** — ✅ Clean European & global remote tech listings
+- Public API endpoint with structured tags and creation timestamps
 
 ### Overall Accuracy Assessment
 
 | Concern | Verdict |
 |---|---|
-| False positives (regular job miscategorised as internship) | Rare — only possible on Jobicy/RemoteOK |
+| False positives (regular job miscategorised as internship) | Rare — only possible on keyword-detected public sources |
 | False negatives (real internship missed) | Possible on sources without explicit type fields |
 | Duplicate listings across sources | Eliminated by SHA-256 deduplication |
-| Stale or expired listings | APIs return recent listings; dedup prevents re-sends |
+| Stale or expired listings | Prioritises fresh listings; dedup prevents re-sends |
 | Script crashing when one source fails | Never — each fetcher is independently error-handled |
 
-**Will it work accurately?** — Yes, for the vast majority of listings. The two sources with structured type fields (Himalayas + Remotive) are fully accurate. The keyword-based detection on Jobicy/RemoteOK works well in practice since most internships include "intern" in the job title.
+**Will it work accurately?** — Yes, for the vast majority of listings. Sources with structured type fields (Himalayas + Remotive) are fully accurate. The keyword-based detection on other boards works well in practice since most internships include "intern" in the job title.
+
 
 ---
 
@@ -524,7 +555,7 @@ The HTML email is divided into two clearly labelled sections with a stats bar at
 │  ┌───────────────────────────────────────────────┐  │
 │  │ Senior Python Developer        [Indigo border]│  │
 │  │ 🏢 Acme Corp                                 │  │
-│  │ 📍 Remote  💰 20k–50k/yr  🔗 Himalayas  │  │
+│  │ 📍 Remote  💰 20k–50k/yr  🔗 Himalayas  ⚡ 24h│  │
 │  │ 🏷️ python, django, postgres                  │  │
 │  │ We are looking for a Senior Python Developer  │  │
 │  │ with 5+ years of experience to join our…     │  │
@@ -535,7 +566,7 @@ The HTML email is divided into two clearly labelled sections with a stats bar at
 │  ┌───────────────────────────────────────────────┐  │
 │  │ Data Science Intern            [Green border] │  │
 │  │ 🏢 OpenAI                                    │  │
-│  │ 📍 Worldwide           🔗 Remotive.com       │  │
+│  │ 📍 Worldwide   🔗 Remotive.com   ⚡ Last 24h  │  │
 │  │ 🏷️ python, data science, machine learning    │  │
 │  │ Join our research team for a 3-month paid…   │  │
 │  │              [ Apply Now → ]                  │  │
@@ -546,8 +577,10 @@ The HTML email is divided into two clearly labelled sections with a stats bar at
 **Design details:**
 - Job cards have an **indigo** (`#4F46E5`) left border
 - Internship cards have an **emerald** (`#059669`) left border
+- Fresh opportunities from the last 24h feature a prominent **`⚡ Last 24h` gold badge**
 - Max width 680px — renders correctly in Gmail, Outlook, Apple Mail
 - Salary and tags are hidden gracefully when not available
+
 
 ---
 

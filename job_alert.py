@@ -3,11 +3,12 @@ daily-job-internship-alerts — job_alert.py
 ==========================================
 Fetches remote jobs & internships from 100+ sources:
   - 5 Public APIs: Himalayas, Remotive, Jobicy, RemoteOK, Arbeitnow
+  - Optional LinkedIn guest search (past 24h jobs, via ENABLE_LINKEDIN=true)
   - 100+ Top Tech Companies via ATS APIs (Greenhouse, Lever, Ashby)
   - Custom sources & resources configured in custom_sources.json / custom_sources.py
 
-Deduplicates listings, applies keyword and interest filters, and delivers
-a modern, responsive HTML digest email.
+Deduplicates listings, applies keyword and interest filters, highlights fresh
+postings (last 24 hours), and delivers a modern, responsive HTML digest email.
 """
 
 import os
@@ -49,6 +50,8 @@ EMAIL_TO_RAW    = os.getenv("EMAIL_TO", "")
 EMAIL_TO        = [e.strip() for e in EMAIL_TO_RAW.split(",") if e.strip()]
 KEYWORDS_RAW    = os.getenv("KEYWORDS", "")
 KEYWORDS        = [k.strip().lower() for k in KEYWORDS_RAW.split(",") if k.strip()]
+
+ENABLE_LINKEDIN = os.getenv("ENABLE_LINKEDIN", "false").strip().lower() in ("true", "1", "yes")
 
 SEEN_JOBS_FILE  = Path("seen_jobs.json")
 REQUEST_TIMEOUT = 12            # seconds per ATS / API call
@@ -125,6 +128,36 @@ def _is_internship(title: str, tags: str = "", commitment: str = "") -> bool:
     return any(k in combined for k in keywords)
 
 
+def is_within_last_24h(date_val: Any) -> bool:
+    """
+    Determine if date_val represents a publication date or timestamp within the last 24 hours.
+    Handles Unix timestamps (seconds or ms), ISO-8601 datetimes, and boolean flags.
+    """
+    if date_val is None or date_val == "":
+        return False
+    if isinstance(date_val, bool):
+        return date_val
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if isinstance(date_val, (int, float)):
+            # Handle timestamps in milliseconds
+            if date_val > 1e11:
+                date_val = date_val / 1000.0
+            dt = datetime.datetime.fromtimestamp(date_val, tz=datetime.timezone.utc)
+            diff = (now - dt).total_seconds()
+            return 0 <= diff <= 86400
+        elif isinstance(date_val, str):
+            clean_str = date_val.strip().replace("Z", "+00:00")
+            dt = datetime.datetime.fromisoformat(clean_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            diff = (now - dt).total_seconds()
+            return 0 <= diff <= 86400
+    except Exception:
+        pass
+    return False
+
+
 def _safe_get(url: str, **kwargs) -> requests.Response | None:
     """Polite GET request with error handling and custom User-Agent."""
     try:
@@ -144,51 +177,109 @@ def _safe_get(url: str, **kwargs) -> requests.Response | None:
 # 1. Public Free Job Boards
 # ---------------------------------------------------------------------------
 
+
 def fetch_himalayas_jobs() -> list[dict]:
-    """Himalayas.app public API — Remote tech jobs."""
-    resp = _safe_get("https://himalayas.app/api/v1/jobs", params={"limit": MAX_JOBS_PER_SOURCE})
+    """Himalayas.app public Browse API — Remote tech jobs."""
+    resp = _safe_get("https://himalayas.app/jobs/api", params={"limit": MAX_JOBS_PER_SOURCE, "sort": "recent"})
     if not resp:
         return []
+    try:
+        data = resp.json()
+    except Exception:
+        return []
+
     jobs = []
-    for item in resp.json().get("jobs", [])[:MAX_JOBS_PER_SOURCE]:
-        s_min = item.get("salaryMin")
-        s_max = item.get("salaryMax")
-        salary = f"${s_min:,}–${s_max:,} / yr" if s_min and s_max else (f"${s_min:,}+" if s_min else "")
+    for item in data.get("jobs", [])[:MAX_JOBS_PER_SOURCE]:
+        s_min = item.get("minSalary") or item.get("salaryMin")
+        s_max = item.get("maxSalary") or item.get("salaryMax")
+        curr = item.get("currency") or "USD"
+        sym = "$" if curr == "USD" else f"{curr} "
+        period = f" / {item.get('salaryPeriod')}" if item.get("salaryPeriod") else " / yr"
+        salary = f"{sym}{s_min:,}–{sym}{s_max:,}{period}" if s_min and s_max else (f"{sym}{s_min:,}+{period}" if s_min else "")
+
         title = item.get("title", "N/A")
+        loc = item.get("locationRestrictions") or "Remote"
+        if isinstance(loc, list):
+            loc = ", ".join(loc) if loc else "Remote"
+
+        pub_date = item.get("pubDate")
+        is_recent = is_within_last_24h(pub_date)
+
+        emp_type = str(item.get("employmentType", ""))
+        is_intern = "intern" in emp_type.lower() or _is_internship(title)
+
+        desc = item.get("excerpt") or _truncate(item.get("description", ""))
+        url = item.get("applicationLink") or item.get("url") or "#"
+        categories = item.get("categories", [])
+        tag_str = ", ".join(categories) if isinstance(categories, list) else str(categories)
+
         jobs.append({
             "title":       title,
             "company":     item.get("companyName", "N/A"),
-            "location":    item.get("locationRestrictions") or "Remote",
+            "location":    loc,
             "salary":      salary,
-            "description": _truncate(item.get("description", "")),
-            "url":         item.get("applicationLink") or item.get("url", "#"),
+            "description": desc,
+            "url":         url,
             "source":      "Himalayas.app",
-            "type":        "internship" if _is_internship(title) else "job",
-            "tags":        ", ".join(item.get("categories", [])),
+            "type":        "internship" if is_intern else "job",
+            "tags":        tag_str,
+            "is_recent":   is_recent,
+            "posted_ts":   pub_date if isinstance(pub_date, (int, float)) else 0,
         })
     return jobs
 
 
 def fetch_himalayas_internships() -> list[dict]:
-    """Himalayas.app public API — Internships filter."""
-    resp = _safe_get(
-        "https://himalayas.app/api/v1/jobs",
-        params={"limit": MAX_JOBS_PER_SOURCE, "employment_type": "Intern"},
-    )
+    """Himalayas.app public Search API — Internships filter."""
+    params: dict[str, Any] = {
+        "employment_type": "Intern",
+        "sort": "recent",
+        "limit": MAX_JOBS_PER_SOURCE,
+    }
+    if KEYWORDS:
+        params["q"] = " ".join(KEYWORDS)
+
+    resp = _safe_get("https://himalayas.app/jobs/api/search", params=params)
     if not resp:
         return []
+    try:
+        data = resp.json()
+    except Exception:
+        return []
+
     internships = []
-    for item in resp.json().get("jobs", [])[:MAX_JOBS_PER_SOURCE]:
+    for item in data.get("jobs", [])[:MAX_JOBS_PER_SOURCE]:
+        s_min = item.get("minSalary") or item.get("salaryMin")
+        s_max = item.get("maxSalary") or item.get("salaryMax")
+        curr = item.get("currency") or "USD"
+        sym = "$" if curr == "USD" else f"{curr} "
+        period = f" / {item.get('salaryPeriod')}" if item.get("salaryPeriod") else " / yr"
+        salary = f"{sym}{s_min:,}–{sym}{s_max:,}{period}" if s_min and s_max else (f"{sym}{s_min:,}+{period}" if s_min else "")
+
+        title = item.get("title", "N/A")
+        loc = item.get("locationRestrictions") or "Remote"
+        if isinstance(loc, list):
+            loc = ", ".join(loc) if loc else "Remote"
+
+        pub_date = item.get("pubDate")
+        is_recent = is_within_last_24h(pub_date)
+        desc = item.get("excerpt") or _truncate(item.get("description", ""))
+        url = item.get("applicationLink") or item.get("url") or "#"
+        categories = item.get("categories", [])
+        tag_str = ", ".join(categories) if isinstance(categories, list) else str(categories)
+
         internships.append({
-            "title":       item.get("title", "N/A"),
+            "title":       title,
             "company":     item.get("companyName", "N/A"),
-            "location":    item.get("locationRestrictions") or "Remote",
-            "salary":      "",
-            "description": _truncate(item.get("description", "")),
-            "url":         item.get("applicationLink") or item.get("url", "#"),
+            "location":    loc,
+            "salary":      salary,
+            "description": desc,
+            "url":         url,
             "source":      "Himalayas.app",
             "type":        "internship",
-            "tags":        ", ".join(item.get("categories", [])),
+            "tags":        tag_str,
+            "is_recent":   is_recent,
+            "posted_ts":   pub_date if isinstance(pub_date, (int, float)) else 0,
         })
     return internships
 
@@ -205,6 +296,9 @@ def fetch_remotive() -> list[dict]:
         if isinstance(tags, list):
             tags = ", ".join(tags)
         is_intern = _is_internship(title, tags=tags, commitment=item.get("job_type", ""))
+        pub_date = item.get("publication_date")
+        is_recent = is_within_last_24h(pub_date)
+
         jobs.append({
             "title":       title,
             "company":     item.get("company_name", "N/A"),
@@ -215,6 +309,8 @@ def fetch_remotive() -> list[dict]:
             "source":      "Remotive.com",
             "type":        "internship" if is_intern else "job",
             "tags":        tags,
+            "is_recent":   is_recent,
+            "posted_ts":   pub_date or 0,
         })
     return jobs
 
@@ -227,6 +323,9 @@ def fetch_jobicy() -> list[dict]:
     jobs = []
     for item in resp.json().get("jobs", [])[:MAX_JOBS_PER_SOURCE]:
         title = item.get("jobTitle", "N/A")
+        pub_date = item.get("pubDate")
+        is_recent = is_within_last_24h(pub_date)
+
         jobs.append({
             "title":       title,
             "company":     item.get("companyName", "N/A"),
@@ -237,6 +336,8 @@ def fetch_jobicy() -> list[dict]:
             "source":      "Jobicy.com",
             "type":        "internship" if _is_internship(title) else "job",
             "tags":        ", ".join(item.get("jobIndustry", [])),
+            "is_recent":   is_recent,
+            "posted_ts":   pub_date or 0,
         })
     return jobs
 
@@ -258,6 +359,9 @@ def fetch_remoteok() -> list[dict]:
         title = item.get("position", "N/A")
         tags = item.get("tags", [])
         tag_str = ", ".join(tags) if isinstance(tags, list) else str(tags)
+        epoch = item.get("epoch") or item.get("date")
+        is_recent = is_within_last_24h(epoch)
+
         jobs.append({
             "title":       title,
             "company":     item.get("company", "N/A"),
@@ -268,6 +372,8 @@ def fetch_remoteok() -> list[dict]:
             "source":      "RemoteOK.com",
             "type":        "internship" if _is_internship(title, tags=tag_str) else "job",
             "tags":        tag_str,
+            "is_recent":   is_recent,
+            "posted_ts":   item.get("epoch") or 0,
         })
     return jobs
 
@@ -281,6 +387,9 @@ def fetch_arbeitnow() -> list[dict]:
     for item in resp.json().get("data", [])[:MAX_JOBS_PER_SOURCE]:
         title = item.get("title", "N/A")
         tags = ", ".join(item.get("tags", []))
+        created_at = item.get("created_at")
+        is_recent = is_within_last_24h(created_at)
+
         jobs.append({
             "title":       title,
             "company":     item.get("company_name", "N/A"),
@@ -291,8 +400,101 @@ def fetch_arbeitnow() -> list[dict]:
             "source":      "Arbeitnow",
             "type":        "internship" if _is_internship(title, tags=tags) else "job",
             "tags":        tags,
+            "is_recent":   is_recent,
+            "posted_ts":   created_at or 0,
         })
     return jobs
+
+
+def fetch_linkedin_jobs() -> list[dict]:
+    """
+    Fetch public job listings from LinkedIn's guest job search endpoint from the last 24 hours.
+
+    DISCLAIMER & WARNING:
+    This endpoint (linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search) is unofficial,
+    unsupported, and may break at any time. It enforces aggressive rate limits (HTTP 429)
+    and scraping LinkedIn may violate LinkedIn's Terms of Service.
+    Use exclusively for personal email alerts at your own risk.
+    """
+    if not ENABLE_LINKEDIN:
+        return []
+
+    url = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+    query = " ".join(KEYWORDS) if KEYWORDS else "software"
+    params = {
+        "keywords": query,
+        "location": "Remote",
+        "f_TPR": "r86400",  # past 24 hours (86,400 seconds)
+        "start": 0,
+    }
+    linkedin_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=linkedin_headers, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 429:
+            log.warning("LinkedIn guest API rate limited (HTTP 429). Skipping LinkedIn fetch.")
+            return []
+        if resp.status_code != 200:
+            log.warning("LinkedIn guest API returned HTTP %d. Skipping LinkedIn fetch.", resp.status_code)
+            return []
+
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            log.error("beautifulsoup4 is required to parse LinkedIn jobs. Run 'pip install beautifulsoup4'.")
+            return []
+
+        import re
+        soup = BeautifulSoup(resp.text, "html.parser")
+        items = soup.find_all("li")
+        if not items:
+            items = soup.find_all("div", class_=re.compile(r"base-card|job-search-card"))
+
+        jobs = []
+        for item in items[:MAX_JOBS_PER_SOURCE]:
+            title_el = item.find(["h3", "h4"], class_=re.compile(r"base-search-card__title|job-title"))
+            title = title_el.get_text(strip=True) if title_el else ""
+            if not title or title.lower() == "n/a":
+                continue
+
+            comp_el = item.find(["h4", "h3", "a"], class_=re.compile(r"base-search-card__subtitle|hidden-nested-link|company-name"))
+            company = comp_el.get_text(strip=True) if comp_el else "Unknown"
+
+            loc_el = item.find("span", class_=re.compile(r"job-search-card__location"))
+            location = loc_el.get_text(strip=True) if loc_el else "Remote"
+
+            link_el = item.find("a", class_=re.compile(r"base-card__full-link|job-search-card"))
+            job_url = link_el["href"] if link_el and link_el.has_attr("href") else "#"
+            if "?" in job_url:
+                job_url = job_url.split("?")[0]
+
+            time_el = item.find("time")
+            posted_text = time_el.get_text(strip=True) if time_el else "Past 24h"
+
+            is_intern = _is_internship(title)
+
+            jobs.append({
+                "title":       title,
+                "company":     company,
+                "location":    location,
+                "salary":      "",
+                "description": f"Posted recently on LinkedIn ({posted_text}). Apply directly on LinkedIn.",
+                "url":         job_url,
+                "source":      "LinkedIn",
+                "type":        "internship" if is_intern else "job",
+                "tags":        "LinkedIn, 24h",
+                "is_recent":   True,
+                "posted_ts":   datetime.datetime.now(datetime.timezone.utc).timestamp(),
+            })
+        return jobs
+    except Exception as exc:
+        log.warning("Could not fetch LinkedIn jobs: %s", exc)
+        return []
+
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +517,8 @@ def fetch_greenhouse_company(company: dict) -> list[dict]:
         location = loc_obj.get("name") if isinstance(loc_obj, dict) else str(loc_obj)
         departments = [d.get("name") for d in item.get("departments", []) if isinstance(d, dict) and d.get("name")]
         tag_str = ", ".join(departments)
+        updated_at = item.get("updated_at")
+        is_recent = is_within_last_24h(updated_at)
 
         jobs.append({
             "title":       title,
@@ -326,6 +530,8 @@ def fetch_greenhouse_company(company: dict) -> list[dict]:
             "source":      f"{name} (Greenhouse)",
             "type":        "internship" if _is_internship(title, tags=tag_str) else "job",
             "tags":        tag_str,
+            "is_recent":   is_recent,
+            "posted_ts":   updated_at or 0,
         })
     return jobs
 
@@ -353,6 +559,8 @@ def fetch_lever_company(company: dict) -> list[dict]:
         commitment = cat.get("commitment") or ""
         team = cat.get("team") or ""
         tag_str = ", ".join([t for t in [team, commitment] if t])
+        created_at = item.get("createdAt")
+        is_recent = is_within_last_24h(created_at)
 
         jobs.append({
             "title":       title,
@@ -364,6 +572,8 @@ def fetch_lever_company(company: dict) -> list[dict]:
             "source":      f"{name} (Lever)",
             "type":        "internship" if _is_internship(title, tags=tag_str, commitment=commitment) else "job",
             "tags":        tag_str,
+            "is_recent":   is_recent,
+            "posted_ts":   created_at or 0,
         })
     return jobs
 
@@ -382,6 +592,8 @@ def fetch_ashby_company(company: dict) -> list[dict]:
         title = item.get("title", "N/A")
         location = item.get("location") or "Remote"
         dept = item.get("department") or ""
+        published_at = item.get("publishedAt")
+        is_recent = is_within_last_24h(published_at)
 
         jobs.append({
             "title":       title,
@@ -393,6 +605,8 @@ def fetch_ashby_company(company: dict) -> list[dict]:
             "source":      f"{name} (Ashby)",
             "type":        "internship" if _is_internship(title, tags=dept) else "job",
             "tags":        dept,
+            "is_recent":   is_recent,
+            "posted_ts":   published_at or 0,
         })
     return jobs
 
@@ -438,6 +652,9 @@ def fetch_custom_feed(feed: dict) -> list[dict]:
             location = item.get("location") or "Remote"
             url_link = item.get("url") or item.get("applicationLink") or "#"
             desc = _truncate(item.get("description", ""))
+            raw_date = item.get("date") or item.get("pubDate") or item.get("created_at") or item.get("published_at")
+            is_recent = is_within_last_24h(raw_date)
+
             jobs.append({
                 "title":       title,
                 "company":     company,
@@ -448,6 +665,8 @@ def fetch_custom_feed(feed: dict) -> list[dict]:
                 "source":      name,
                 "type":        "internship" if _is_internship(title) else "job",
                 "tags":        item.get("tags", ""),
+                "is_recent":   is_recent,
+                "posted_ts":   raw_date or 0,
             })
     except Exception as exc:
         log.warning("Could not parse custom feed %s: %s", name, exc)
@@ -462,9 +681,9 @@ def fetch_all() -> tuple[list[dict], list[dict], int]:
     """
     Fetch from all enabled sources concurrently:
     - Merged default + custom companies
-    - Public job boards
+    - Public job boards (+ optional LinkedIn guest search)
     - Custom feeds
-    Deduplicates against seen_jobs.json and applies keyword filters.
+    Deduplicates against seen_jobs.json, filters keywords, and sorts by recency.
     Returns (regular_jobs, internships, total_sources_checked).
     """
     seen = load_seen_jobs()
@@ -481,6 +700,9 @@ def fetch_all() -> tuple[list[dict], list[dict], int]:
         ("RemoteOK", fetch_remoteok),
         ("Arbeitnow", fetch_arbeitnow),
     ]
+
+    if ENABLE_LINKEDIN:
+        public_board_fetchers.append(("LinkedIn (24h)", fetch_linkedin_jobs))
 
     # If user selected interested_only mode, skip generic public boards
     # unless specifically named in filter_sources
@@ -540,6 +762,18 @@ def fetch_all() -> tuple[list[dict], list[dict], int]:
             jobs.append(listing)
 
     save_seen_jobs(new_seen)
+
+    # Prefer fresher listings (posted within last 24h) first, then by timestamp
+    def _recency_sort_key(item: dict) -> tuple:
+        is_rec = 1 if item.get("is_recent") else 0
+        ts = item.get("posted_ts", 0)
+        if not isinstance(ts, (int, float)):
+            ts = 0
+        return (is_rec, ts)
+
+    jobs.sort(key=_recency_sort_key, reverse=True)
+    internships.sort(key=_recency_sort_key, reverse=True)
+
     log.info("New unique jobs: %d | New unique internships: %d", len(jobs), len(internships))
     return jobs, internships, total_sources_count
 
@@ -556,6 +790,9 @@ def _job_card_html(job: dict, accent: str) -> str:
     tags_html = (
         f'<p class="tags">🏷️ {job["tags"]}</p>' if job.get("tags") else ""
     )
+    recent_badge = (
+        '<span class="badge-recent">⚡ Last 24h</span>' if job.get("is_recent") else ""
+    )
     return f"""
     <div class="card">
       <div class="card-header" style="border-left: 5px solid {accent};">
@@ -565,6 +802,7 @@ def _job_card_html(job: dict, accent: str) -> str:
           <span class="location">📍 {job['location']}</span>
           {salary_html}
           <span class="source">🔗 {job['source']}</span>
+          {recent_badge}
         </div>
       </div>
       {tags_html}
@@ -573,6 +811,7 @@ def _job_card_html(job: dict, accent: str) -> str:
          style="background:{accent};">Apply Now →</a>
     </div>
     """
+
 
 
 def build_html_email(jobs: list[dict], internships: list[dict], total_sources: int) -> str:
@@ -662,11 +901,15 @@ def build_html_email(jobs: list[dict], internships: list[dict], total_sources: i
   .job-title {{ font-size: 16px; font-weight: 700; color: #111827; margin-bottom: 4px; }}
   .company {{ font-size: 13px; color: #6B7280; margin-bottom: 8px; font-weight: 500; }}
   .meta {{ display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: #6B7280; }}
-  .location, .salary, .source {{
+  .location, .salary, .source, .badge-recent {{
     display: inline-flex; align-items: center; gap: 4px;
     background: #F3F4F6; border-radius: 6px; padding: 2px 8px;
   }}
   .salary {{ color: #065F46; background: #D1FAE5; }}
+  .badge-recent {{
+    background: #FEF3C7; color: #92400E; border: 1px solid #FCD34D;
+    font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 0.3px;
+  }}
   .tags {{ padding: 8px 20px; font-size: 12px; color: #6B7280; background: #F9FAFB; }}
   .description {{
     padding: 12px 20px;

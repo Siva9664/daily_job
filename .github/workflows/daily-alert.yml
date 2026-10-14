@@ -30,9 +30,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: seen_jobs.json
-          key: seen-jobs-${{ runner.os }}-${{ github.run_id }}
+          key: seen-jobs-${{ runner.os }}
           restore-keys: |
             seen-jobs-${{ runner.os }}-
+            seen-jobs-
 
       # ── 3. Set up Python ──────────────────────────────────
       - name: Set up Python 3.11
@@ -50,8 +51,10 @@ jobs:
       # Set these in your repo → Settings → Secrets → Actions
       - name: Run job alert
         env:
-          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
-          KEYWORDS:       ${{ secrets.KEYWORDS }}
+          EMAIL_FROM:      ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD:  ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO:        ${{ secrets.EMAIL_TO }}
+          KEYWORDS:        ${{ secrets.KEYWORDS }}
+          ENABLE_LINKEDIN: ${{ secrets.ENABLE_LINKEDIN || vars.ENABLE_LINKEDIN || 'false' }}
         run: python job_alert.py
+
