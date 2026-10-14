@@ -15,13 +15,19 @@ from companies import COMPANIES as DEFAULT_COMPANIES
 log = logging.getLogger(__name__)
 
 CUSTOM_SOURCES_JSON = Path("custom_sources.json")
+_CONFIG_CACHE: dict[str, Any] | None = None
 
 
-def load_custom_config() -> dict[str, Any]:
+def load_custom_config(refresh: bool = False) -> dict[str, Any]:
     """
     Load custom sources and filter settings.
     Prioritizes custom_sources.json, then falls back to/merges custom_sources.py.
+    Caches result unless refresh=True.
     """
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE is not None and not refresh:
+        return _CONFIG_CACHE
+
     config: dict[str, Any] = {
         "interested_only": False,
         "filter_sources": [],
@@ -82,15 +88,17 @@ def load_custom_config() -> dict[str, Any]:
     except Exception as exc:
         log.warning("Could not import custom_sources.py: %s", exc)
 
+    _CONFIG_CACHE = config
     return config
 
 
-def get_active_companies() -> tuple[list[dict], bool, list[str]]:
+def get_active_companies(config: dict[str, Any] | None = None) -> tuple[list[dict], bool, list[str]]:
     """
     Returns (companies_list, interested_only, filter_sources).
     Merges default ATS companies with custom companies, deduplicating by (ats, token).
     """
-    config = load_custom_config()
+    if config is None:
+        config = load_custom_config()
     interested_only = config["interested_only"]
     filter_sources = config["filter_sources"]
     custom_cos = config["ats_companies"]
@@ -133,7 +141,9 @@ def get_active_companies() -> tuple[list[dict], bool, list[str]]:
     return base_list, interested_only, filter_sources
 
 
-def get_custom_feeds() -> list[dict]:
+def get_custom_feeds(config: dict[str, Any] | None = None) -> list[dict]:
     """Returns active custom API feeds from config."""
-    config = load_custom_config()
+    if config is None:
+        config = load_custom_config()
     return config.get("custom_feeds", [])
+

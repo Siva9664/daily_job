@@ -41,7 +41,7 @@ def test_parse_timestamp_iso_string():
 
 def test_recency_sort_recent_first():
     ja = load_job_alert()
-    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    now = datetime.datetime.now(datetime.UTC).timestamp()
     items = [
         {"title": "old", "is_recent": False, "posted_ts": now - 200000},
         {"title": "recent-old", "is_recent": True, "posted_ts": now - 3600},
@@ -101,3 +101,15 @@ def test_send_email_failure_returns_false_and_keeps_seen():
         smtplib.SMTP = orig
     after = seen_path.read_text() if seen_path.exists() else ""
     assert before == after
+
+
+def test_send_email_includes_plain_and_html_parts_in_order():
+    """Digest must be multipart/alternative with plain first, HTML second."""
+    import inspect
+
+    ja = load_job_alert()
+    src = inspect.getsource(ja.send_email)
+    assert 'MIMEText(plain_body, "plain"' in src
+    assert 'MIMEText(html_body, "html"' in src
+    assert src.index('"plain"') < src.index('"html"')
+

@@ -11,17 +11,21 @@ Deduplicates listings, applies keyword and interest filters, highlights fresh
 postings (last 24 hours), and delivers a modern, responsive HTML digest email.
 """
 
-import os
-import json
-import hashlib
-import smtplib
-import logging
 import datetime
+import hashlib
+import html
+import json
+import logging
+import os
+import re
+import smtplib
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -56,10 +60,15 @@ ENABLE_LINKEDIN = os.getenv("ENABLE_LINKEDIN", "false").strip().lower() in ("tru
 SEEN_JOBS_FILE  = Path("seen_jobs.json")
 REQUEST_TIMEOUT = 12            # seconds per ATS / API call
 MAX_WORKERS     = 20            # concurrent HTTP worker threads
-MAX_JOBS_PER_SOURCE = 25        # cap per source to keep email digest curated
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) daily-job-alerts/2.0"
 HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+
+# Regex for detecting internships using exact word boundaries
+INTERN_REGEX = re.compile(
+    r"\b(?:intern(?:ship)?s?|co-?ops?|apprentice(?:ship)?s?|working\s+student|student\s+worker)\b",
+    re.IGNORECASE,
+)
 
 # ---------------------------------------------------------------------------
 # Deduplication helpers
@@ -71,7 +80,7 @@ def load_seen_jobs() -> set:
         try:
             data = json.loads(SEEN_JOBS_FILE.read_text(encoding="utf-8"))
             return set(data)
-        except (json.JSONDecodeError, IOError) as exc:
+        except (OSError, json.JSONDecodeError) as exc:
             log.warning("Could not load seen_jobs.json: %s", exc)
     return set()
 
@@ -82,13 +91,13 @@ def save_seen_jobs(seen: set) -> None:
         SEEN_JOBS_FILE.write_text(
             json.dumps(sorted(seen), indent=2), encoding="utf-8"
         )
-    except IOError as exc:
+    except OSError as exc:
         log.warning("Could not save seen_jobs.json: %s", exc)
 
 
 def job_hash(title: str, company: str, url: str) -> str:
     """Stable SHA-256 fingerprint for a job listing."""
-    key = f"{title.lower().strip()}|{company.lower().strip()}|{url.strip()}"
+    key = f"{_to_str(title).lower().strip()}|{_to_str(company).lower().strip()}|{_to_str(url).strip()}"
     return hashlib.sha256(key.encode()).hexdigest()
 
 
@@ -96,36 +105,96 @@ def job_hash(title: str, company: str, url: str) -> str:
 # Keyword filtering & text helpers
 # ---------------------------------------------------------------------------
 
+def _to_str(val: Any) -> str:
+    """Safely coerce any value (lists, ints, None) to a string."""
+    if val is None:
+        return ""
+    if isinstance(val, (list, tuple, set)):
+        return ", ".join(str(x) for x in val if x is not None)
+    return str(val)
+
+
+def _safe_int(val: Any) -> int | None:
+    """Safely parse integer from number or string, stripping non-digit characters."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        try:
+            return int(val)
+        except (ValueError, OverflowError):
+            return None
+    if isinstance(val, str):
+        cleaned = re.sub(r"[^\d.]", "", val)
+        if cleaned:
+            try:
+                return int(float(cleaned))
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
+def _safe_url(url: Any) -> str:
+    """Only allow valid http and https URLs; fallback to #."""
+    if not url:
+        return "#"
+    raw_str = str(url).strip()
+    try:
+        parsed = urlparse(raw_str)
+        if parsed.scheme.lower() in ("http", "https") and parsed.netloc:
+            return html.escape(raw_str, quote=True)
+    except Exception:
+        pass
+    return "#"
+
+
+def _parse_timestamp(val: Any) -> float:
+    """Parse integer, float, or ISO-8601 string date to epoch timestamp float."""
+    if val is None or val == "":
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val / 1000.0 if val > 1e11 else val)
+    if isinstance(val, str):
+        try:
+            clean = val.strip().replace("Z", "+00:00")
+            dt = datetime.datetime.fromisoformat(clean)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            return 0.0
+    return 0.0
+
+
 def matches_keywords(job: dict) -> bool:
     """Return True if job matches configured keywords (or if no keywords set)."""
     if not KEYWORDS:
         return True
     haystack = " ".join([
-        job.get("title", ""),
-        job.get("company", ""),
-        job.get("description", ""),
-        job.get("tags", ""),
+        _to_str(job.get("title")),
+        _to_str(job.get("company")),
+        _to_str(job.get("description")),
+        _to_str(job.get("tags")),
     ]).lower()
     return any(kw in haystack for kw in KEYWORDS)
 
 
-def _truncate(text: str, max_len: int = 280) -> str:
+def _truncate(text: Any, max_len: int = 280) -> str:
     """Strip HTML tags crudely and truncate cleanly to max_len characters."""
-    import re
-    if not text:
+    clean_text = _to_str(text)
+    if not clean_text:
         return ""
-    clean = re.sub(r"<[^>]+>", " ", text)
+    clean = re.sub(r"<[^>]+>", " ", clean_text)
     clean = re.sub(r"\s+", " ", clean).strip()
     if len(clean) > max_len:
         return clean[:max_len].rsplit(" ", 1)[0] + "…"
     return clean
 
 
-def _is_internship(title: str, tags: str = "", commitment: str = "") -> bool:
-    """Detect if listing is an internship, co-op, or apprentice role."""
-    combined = f"{title} {tags} {commitment}".lower()
-    keywords = ["intern", "internship", "co-op", "apprentice", "working student", "student worker"]
-    return any(k in combined for k in keywords)
+def _is_internship(title: Any, tags: Any = "", commitment: Any = "") -> bool:
+    """Detect if listing is an internship, co-op, or apprentice role using regex with word boundaries."""
+    combined = f"{_to_str(title)} {_to_str(tags)} {_to_str(commitment)}"
+    return bool(INTERN_REGEX.search(combined))
+
 
 
 def is_within_last_24h(date_val: Any) -> bool:
@@ -180,18 +249,19 @@ def _safe_get(url: str, **kwargs) -> requests.Response | None:
 
 def fetch_himalayas_jobs() -> list[dict]:
     """Himalayas.app public Browse API — Remote tech jobs."""
-    resp = _safe_get("https://himalayas.app/jobs/api", params={"limit": MAX_JOBS_PER_SOURCE, "sort": "recent"})
+    resp = _safe_get("https://himalayas.app/jobs/api", params={"sort": "recent"})
     if not resp:
         return []
     try:
         data = resp.json()
-    except Exception:
+    except Exception as exc:
+        log.warning("Failed to parse JSON from Himalayas Jobs: %s", exc)
         return []
 
     jobs = []
-    for item in data.get("jobs", [])[:MAX_JOBS_PER_SOURCE]:
-        s_min = item.get("minSalary") or item.get("salaryMin")
-        s_max = item.get("maxSalary") or item.get("salaryMax")
+    for item in data.get("jobs", []):
+        s_min = _safe_int(item.get("minSalary") or item.get("salaryMin"))
+        s_max = _safe_int(item.get("maxSalary") or item.get("salaryMax"))
         curr = item.get("currency") or "USD"
         sym = "$" if curr == "USD" else f"{curr} "
         period = f" / {item.get('salaryPeriod')}" if item.get("salaryPeriod") else " / yr"
@@ -209,7 +279,7 @@ def fetch_himalayas_jobs() -> list[dict]:
         is_intern = "intern" in emp_type.lower() or _is_internship(title)
 
         desc = item.get("excerpt") or _truncate(item.get("description", ""))
-        url = item.get("applicationLink") or item.get("url") or "#"
+        url = _safe_url(item.get("applicationLink") or item.get("url"))
         categories = item.get("categories", [])
         tag_str = ", ".join(categories) if isinstance(categories, list) else str(categories)
 
@@ -224,7 +294,7 @@ def fetch_himalayas_jobs() -> list[dict]:
             "type":        "internship" if is_intern else "job",
             "tags":        tag_str,
             "is_recent":   is_recent,
-            "posted_ts":   pub_date if isinstance(pub_date, (int, float)) else 0,
+            "posted_ts":   _parse_timestamp(pub_date),
         })
     return jobs
 
@@ -234,7 +304,6 @@ def fetch_himalayas_internships() -> list[dict]:
     params: dict[str, Any] = {
         "employment_type": "Intern",
         "sort": "recent",
-        "limit": MAX_JOBS_PER_SOURCE,
     }
     if KEYWORDS:
         params["q"] = " ".join(KEYWORDS)
@@ -244,13 +313,14 @@ def fetch_himalayas_internships() -> list[dict]:
         return []
     try:
         data = resp.json()
-    except Exception:
+    except Exception as exc:
+        log.warning("Failed to parse JSON from Himalayas Internships: %s", exc)
         return []
 
     internships = []
-    for item in data.get("jobs", [])[:MAX_JOBS_PER_SOURCE]:
-        s_min = item.get("minSalary") or item.get("salaryMin")
-        s_max = item.get("maxSalary") or item.get("salaryMax")
+    for item in data.get("jobs", []):
+        s_min = _safe_int(item.get("minSalary") or item.get("salaryMin"))
+        s_max = _safe_int(item.get("maxSalary") or item.get("salaryMax"))
         curr = item.get("currency") or "USD"
         sym = "$" if curr == "USD" else f"{curr} "
         period = f" / {item.get('salaryPeriod')}" if item.get("salaryPeriod") else " / yr"
@@ -264,7 +334,7 @@ def fetch_himalayas_internships() -> list[dict]:
         pub_date = item.get("pubDate")
         is_recent = is_within_last_24h(pub_date)
         desc = item.get("excerpt") or _truncate(item.get("description", ""))
-        url = item.get("applicationLink") or item.get("url") or "#"
+        url = _safe_url(item.get("applicationLink") or item.get("url"))
         categories = item.get("categories", [])
         tag_str = ", ".join(categories) if isinstance(categories, list) else str(categories)
 
@@ -279,18 +349,24 @@ def fetch_himalayas_internships() -> list[dict]:
             "type":        "internship",
             "tags":        tag_str,
             "is_recent":   is_recent,
-            "posted_ts":   pub_date if isinstance(pub_date, (int, float)) else 0,
+            "posted_ts":   _parse_timestamp(pub_date),
         })
     return internships
 
 
 def fetch_remotive() -> list[dict]:
     """Remotive free public API."""
-    resp = _safe_get("https://remotive.com/api/remote-jobs", params={"limit": MAX_JOBS_PER_SOURCE})
+    resp = _safe_get("https://remotive.com/api/remote-jobs")
     if not resp:
         return []
+    try:
+        data = resp.json()
+    except Exception as exc:
+        log.warning("Failed to parse JSON from Remotive: %s", exc)
+        return []
+
     jobs = []
-    for item in resp.json().get("jobs", [])[:MAX_JOBS_PER_SOURCE]:
+    for item in data.get("jobs", []):
         title = item.get("title", "N/A")
         tags = item.get("tags") or ""
         if isinstance(tags, list):
@@ -305,26 +381,40 @@ def fetch_remotive() -> list[dict]:
             "location":    item.get("candidate_required_location") or "Worldwide",
             "salary":      item.get("salary", ""),
             "description": _truncate(item.get("description", "")),
-            "url":         item.get("url", "#"),
+            "url":         _safe_url(item.get("url")),
             "source":      "Remotive.com",
             "type":        "internship" if is_intern else "job",
             "tags":        tags,
             "is_recent":   is_recent,
-            "posted_ts":   pub_date or 0,
+            "posted_ts":   _parse_timestamp(pub_date),
         })
     return jobs
 
 
 def fetch_jobicy() -> list[dict]:
     """Jobicy public API."""
-    resp = _safe_get("https://jobicy.com/api/v2/remote-jobs", params={"count": MAX_JOBS_PER_SOURCE})
+    resp = _safe_get("https://jobicy.com/api/v2/remote-jobs")
     if not resp:
         return []
+    try:
+        data = resp.json()
+    except Exception as exc:
+        log.warning("Failed to parse JSON from Jobicy: %s", exc)
+        return []
+
     jobs = []
-    for item in resp.json().get("jobs", [])[:MAX_JOBS_PER_SOURCE]:
+    for item in data.get("jobs", []):
         title = item.get("jobTitle", "N/A")
         pub_date = item.get("pubDate")
         is_recent = is_within_last_24h(pub_date)
+
+        ind = item.get("jobIndustry")
+        if isinstance(ind, list):
+            tags = ", ".join(str(x) for x in ind if x)
+        elif isinstance(ind, str):
+            tags = ind
+        else:
+            tags = ""
 
         jobs.append({
             "title":       title,
@@ -332,12 +422,12 @@ def fetch_jobicy() -> list[dict]:
             "location":    item.get("jobGeo") or "Remote",
             "salary":      item.get("annualSalaryMax", ""),
             "description": _truncate(item.get("jobExcerpt", "")),
-            "url":         item.get("url", "#"),
+            "url":         _safe_url(item.get("url")),
             "source":      "Jobicy.com",
             "type":        "internship" if _is_internship(title) else "job",
-            "tags":        ", ".join(item.get("jobIndustry", [])),
+            "tags":        tags,
             "is_recent":   is_recent,
-            "posted_ts":   pub_date or 0,
+            "posted_ts":   _parse_timestamp(pub_date),
         })
     return jobs
 
@@ -347,13 +437,19 @@ def fetch_remoteok() -> list[dict]:
     resp = _safe_get("https://remoteok.com/api")
     if not resp:
         return []
-    raw = resp.json()
+    try:
+        raw = resp.json()
+    except Exception as exc:
+        log.warning("Failed to parse JSON from RemoteOK: %s", exc)
+        return []
+
     if isinstance(raw, list) and len(raw) > 1:
         raw = raw[1:]  # first element is legal notice
     else:
         return []
+
     jobs = []
-    for item in raw[:MAX_JOBS_PER_SOURCE]:
+    for item in raw:
         if not isinstance(item, dict):
             continue
         title = item.get("position", "N/A")
@@ -368,12 +464,12 @@ def fetch_remoteok() -> list[dict]:
             "location":    item.get("location") or "Remote",
             "salary":      item.get("salary", ""),
             "description": _truncate(item.get("description", "")),
-            "url":         item.get("url") or f"https://remoteok.com/l/{item.get('id', '')}",
+            "url":         _safe_url(item.get("url") or f"https://remoteok.com/l/{item.get('id', '')}"),
             "source":      "RemoteOK.com",
             "type":        "internship" if _is_internship(title, tags=tag_str) else "job",
             "tags":        tag_str,
             "is_recent":   is_recent,
-            "posted_ts":   item.get("epoch") or 0,
+            "posted_ts":   _parse_timestamp(item.get("epoch") or 0),
         })
     return jobs
 
@@ -383,10 +479,16 @@ def fetch_arbeitnow() -> list[dict]:
     resp = _safe_get("https://www.arbeitnow.com/api/job-board-api")
     if not resp:
         return []
+    try:
+        data = resp.json()
+    except Exception as exc:
+        log.warning("Failed to parse JSON from Arbeitnow: %s", exc)
+        return []
+
     jobs = []
-    for item in resp.json().get("data", [])[:MAX_JOBS_PER_SOURCE]:
+    for item in data.get("data", []):
         title = item.get("title", "N/A")
-        tags = ", ".join(item.get("tags", []))
+        tags = ", ".join(item.get("tags", [])) if isinstance(item.get("tags"), list) else str(item.get("tags", ""))
         created_at = item.get("created_at")
         is_recent = is_within_last_24h(created_at)
 
@@ -396,12 +498,12 @@ def fetch_arbeitnow() -> list[dict]:
             "location":    item.get("location") or "Remote",
             "salary":      "",
             "description": _truncate(item.get("description", "")),
-            "url":         item.get("url", "#"),
+            "url":         _safe_url(item.get("url")),
             "source":      "Arbeitnow",
             "type":        "internship" if _is_internship(title, tags=tags) else "job",
             "tags":        tags,
             "is_recent":   is_recent,
-            "posted_ts":   created_at or 0,
+            "posted_ts":   _parse_timestamp(created_at),
         })
     return jobs
 
@@ -448,14 +550,13 @@ def fetch_linkedin_jobs() -> list[dict]:
             log.error("beautifulsoup4 is required to parse LinkedIn jobs. Run 'pip install beautifulsoup4'.")
             return []
 
-        import re
         soup = BeautifulSoup(resp.text, "html.parser")
         items = soup.find_all("li")
         if not items:
             items = soup.find_all("div", class_=re.compile(r"base-card|job-search-card"))
 
         jobs = []
-        for item in items[:MAX_JOBS_PER_SOURCE]:
+        for item in items:
             title_el = item.find(["h3", "h4"], class_=re.compile(r"base-search-card__title|job-title"))
             title = title_el.get_text(strip=True) if title_el else ""
             if not title or title.lower() == "n/a":
@@ -483,9 +584,9 @@ def fetch_linkedin_jobs() -> list[dict]:
                 "location":    location,
                 "salary":      "",
                 "description": f"Posted recently on LinkedIn ({posted_text}). Apply directly on LinkedIn.",
-                "url":         job_url,
-                "source":      "LinkedIn",
-                "type":        "internship" if is_intern else "job",
+            "url":         _safe_url(job_url),
+            "source":      "LinkedIn",
+            "type":        "internship" if is_intern else "job",
                 "tags":        "LinkedIn, 24h",
                 "is_recent":   True,
                 "posted_ts":   datetime.datetime.now(datetime.timezone.utc).timestamp(),
@@ -494,6 +595,7 @@ def fetch_linkedin_jobs() -> list[dict]:
     except Exception as exc:
         log.warning("Could not fetch LinkedIn jobs: %s", exc)
         return []
+
 
 
 
@@ -510,8 +612,14 @@ def fetch_greenhouse_company(company: dict) -> list[dict]:
     if not resp:
         return []
 
+    try:
+        data = resp.json()
+    except Exception as exc:
+        log.warning("Failed to parse JSON from Greenhouse for %s: %s", name, exc)
+        return []
+
     jobs = []
-    for item in resp.json().get("jobs", [])[:MAX_JOBS_PER_SOURCE]:
+    for item in data.get("jobs", []):
         title = item.get("title", "N/A")
         loc_obj = item.get("location") or {}
         location = loc_obj.get("name") if isinstance(loc_obj, dict) else str(loc_obj)
@@ -526,12 +634,12 @@ def fetch_greenhouse_company(company: dict) -> list[dict]:
             "location":    location or "Remote",
             "salary":      "",
             "description": f"Direct opening on {name}'s official career board ({tag_str})." if tag_str else f"Direct opening on {name}'s official career board.",
-            "url":         item.get("absolute_url") or "#",
+            "url":         _safe_url(item.get("absolute_url")),
             "source":      f"{name} (Greenhouse)",
             "type":        "internship" if _is_internship(title, tags=tag_str) else "job",
             "tags":        tag_str,
             "is_recent":   is_recent,
-            "posted_ts":   updated_at or 0,
+            "posted_ts":   _parse_timestamp(updated_at),
         })
     return jobs
 
@@ -545,12 +653,17 @@ def fetch_lever_company(company: dict) -> list[dict]:
     if not resp:
         return []
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except Exception as exc:
+        log.warning("Failed to parse JSON from Lever for %s: %s", name, exc)
+        return []
+
     if not isinstance(data, list):
         return []
 
     jobs = []
-    for item in data[:MAX_JOBS_PER_SOURCE]:
+    for item in data:
         if not isinstance(item, dict):
             continue
         title = item.get("text", "N/A")
@@ -568,12 +681,12 @@ def fetch_lever_company(company: dict) -> list[dict]:
             "location":    location,
             "salary":      "",
             "description": f"Direct posting on {name} career portal ({tag_str})." if tag_str else f"Direct posting on {name} career portal.",
-            "url":         item.get("hostedUrl") or item.get("applyUrl") or "#",
+            "url":         _safe_url(item.get("hostedUrl") or item.get("applyUrl")),
             "source":      f"{name} (Lever)",
             "type":        "internship" if _is_internship(title, tags=tag_str, commitment=commitment) else "job",
             "tags":        tag_str,
             "is_recent":   is_recent,
-            "posted_ts":   created_at or 0,
+            "posted_ts":   _parse_timestamp(created_at),
         })
     return jobs
 
@@ -587,8 +700,14 @@ def fetch_ashby_company(company: dict) -> list[dict]:
     if not resp:
         return []
 
+    try:
+        data = resp.json()
+    except Exception as exc:
+        log.warning("Failed to parse JSON from Ashby for %s: %s", name, exc)
+        return []
+
     jobs = []
-    for item in resp.json().get("jobs", [])[:MAX_JOBS_PER_SOURCE]:
+    for item in data.get("jobs", []):
         title = item.get("title", "N/A")
         location = item.get("location") or "Remote"
         dept = item.get("department") or ""
@@ -601,12 +720,12 @@ def fetch_ashby_company(company: dict) -> list[dict]:
             "location":    location,
             "salary":      "",
             "description": f"Official position at {name} ({dept})." if dept else f"Official position at {name}.",
-            "url":         item.get("jobUrl") or "#",
+            "url":         _safe_url(item.get("jobUrl")),
             "source":      f"{name} (Ashby)",
             "type":        "internship" if _is_internship(title, tags=dept) else "job",
             "tags":        dept,
             "is_recent":   is_recent,
-            "posted_ts":   published_at or 0,
+            "posted_ts":   _parse_timestamp(published_at),
         })
     return jobs
 
@@ -644,7 +763,7 @@ def fetch_custom_feed(feed: dict) -> list[dict]:
     try:
         data = resp.json()
         items = data if isinstance(data, list) else data.get("jobs", data.get("data", []))
-        for item in items[:MAX_JOBS_PER_SOURCE]:
+        for item in items:
             if not isinstance(item, dict):
                 continue
             title = item.get("title") or item.get("jobTitle") or item.get("position") or "N/A"
@@ -661,12 +780,12 @@ def fetch_custom_feed(feed: dict) -> list[dict]:
                 "location":    location,
                 "salary":      item.get("salary", ""),
                 "description": desc,
-                "url":         url_link,
+                "url":         _safe_url(url_link),
                 "source":      name,
                 "type":        "internship" if _is_internship(title) else "job",
                 "tags":        item.get("tags", ""),
                 "is_recent":   is_recent,
-                "posted_ts":   raw_date or 0,
+                "posted_ts":   _parse_timestamp(raw_date),
             })
     except Exception as exc:
         log.warning("Could not parse custom feed %s: %s", name, exc)
@@ -677,18 +796,21 @@ def fetch_custom_feed(feed: dict) -> list[dict]:
 # Aggregation & Concurrency
 # ---------------------------------------------------------------------------
 
-def fetch_all() -> tuple[list[dict], list[dict], int]:
+def fetch_all() -> tuple[list[dict], list[dict], int, set]:
     """
     Fetch from all enabled sources concurrently:
     - Merged default + custom companies
     - Public job boards (+ optional LinkedIn guest search)
     - Custom feeds
-    Deduplicates against seen_jobs.json, filters keywords, and sorts by recency.
-    Returns (regular_jobs, internships, total_sources_checked).
+    Deduplicates against seen_jobs.json (past sent jobs) and within the run,
+    filters keywords, and sorts by recency.
+    Returns (regular_jobs, internships, total_sources_checked, new_seen_hashes)
+    where new_seen_hashes is the set of hashes for the jobs and internships
+    that passed the keyword filter and are to be sent (to be saved in seen_jobs.json
+    only after successful email send).
     """
-    seen = load_seen_jobs()
-    new_seen = set(seen)
-
+    seen_past = load_seen_jobs()   # jobs sent in past runs
+    seen_run = set()               # jobs seen in current run (to avoid duplicates within run)
     companies, interested_only, filter_sources = get_active_companies()
     custom_feeds = get_custom_feeds()
 
@@ -751,31 +873,41 @@ def fetch_all() -> tuple[list[dict], list[dict], int]:
     jobs, internships = [], []
     for listing in all_listings:
         h = job_hash(listing["title"], listing["company"], listing["url"])
-        if h in seen:
+        if h in seen_past or h in seen_run:
             continue
+        seen_run.add(h)   # mark as seen in this run
         if not matches_keywords(listing):
             continue
-        new_seen.add(h)
+        # Passed keyword filter and not seen before
         if listing["type"] == "internship":
             internships.append(listing)
         else:
             jobs.append(listing)
-
-    save_seen_jobs(new_seen)
 
     # Prefer fresher listings (posted within last 24h) first, then by timestamp
     def _recency_sort_key(item: dict) -> tuple:
         is_rec = 1 if item.get("is_recent") else 0
         ts = item.get("posted_ts", 0)
         if not isinstance(ts, (int, float)):
-            ts = 0
+            try:
+                ts = _parse_timestamp(ts)
+            except Exception:
+                ts = 0
         return (is_rec, ts)
 
     jobs.sort(key=_recency_sort_key, reverse=True)
     internships.sort(key=_recency_sort_key, reverse=True)
 
     log.info("New unique jobs: %d | New unique internships: %d", len(jobs), len(internships))
-    return jobs, internships, total_sources_count
+
+    # Compute the set of hashes for the jobs and internships we are sending
+    new_seen_hashes = set()
+    for job in jobs:
+        new_seen_hashes.add(job_hash(job["title"], job["company"], job["url"]))
+    for intern in internships:
+        new_seen_hashes.add(job_hash(intern["title"], intern["company"], intern["url"]))
+
+    return jobs, internships, total_sources_count, new_seen_hashes
 
 
 # ---------------------------------------------------------------------------
@@ -785,10 +917,10 @@ def fetch_all() -> tuple[list[dict], list[dict], int]:
 def _job_card_html(job: dict, accent: str) -> str:
     """Render an individual job or internship card."""
     salary_html = (
-        f'<span class="salary">💰 {job["salary"]}</span>' if job.get("salary") else ""
+        f'<span class="salary">💰 {html.escape(job["salary"])}</span>' if job.get("salary") else ""
     )
     tags_html = (
-        f'<p class="tags">🏷️ {job["tags"]}</p>' if job.get("tags") else ""
+        f'<p class="tags">🏷️ {html.escape(job["tags"])}</p>' if job.get("tags") else ""
     )
     recent_badge = (
         '<span class="badge-recent">⚡ Last 24h</span>' if job.get("is_recent") else ""
@@ -796,18 +928,18 @@ def _job_card_html(job: dict, accent: str) -> str:
     return f"""
     <div class="card">
       <div class="card-header" style="border-left: 5px solid {accent};">
-        <h3 class="job-title">{job['title']}</h3>
-        <p class="company">🏢 {job['company']}</p>
+        <h3 class="job-title">{html.escape(job["title"])}</h3>
+        <p class="company">🏢 {html.escape(job["company"])}</p>
         <div class="meta">
-          <span class="location">📍 {job['location']}</span>
+          <span class="location">📍 {html.escape(job["location"])}</span>
           {salary_html}
-          <span class="source">🔗 {job['source']}</span>
+          <span class="source">🔗 {html.escape(job["source"])}</span>
           {recent_badge}
         </div>
       </div>
       {tags_html}
-      <p class="description">{job['description']}</p>
-      <a class="apply-btn" href="{job['url']}" target="_blank"
+      <p class="description">{html.escape(job["description"])}</p>
+      <a class="apply-btn" href="{job["url"]}" target="_blank"
          style="background:{accent};">Apply Now →</a>
     </div>
     """
@@ -1027,6 +1159,13 @@ def send_email(html_body: str, jobs: list[dict], internships: list[dict]) -> Non
     msg["Subject"] = subject
     msg["From"]    = EMAIL_FROM
     msg["To"]      = ", ".join(EMAIL_TO)
+    plain_body = (
+        f"daily-job-internship-alerts — {total} new opportunities ({today})\n\n"
+        + "\n".join(f"- {j.get('title')} @ {j.get('company')} [{j.get('source')}] {j.get('url')}" for j in jobs)
+        + ("\n" if internships else "")
+        + "\n".join(f"- {i.get('title')} @ {i.get('company')} [{i.get('source')}] {i.get('url')}" for i in internships)
+    )
+    msg.attach(MIMEText(plain_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
@@ -1060,7 +1199,7 @@ def main() -> None:
     else:
         log.info("No keyword filter active — checking all listings")
 
-    jobs, internships, total_sources = fetch_all()
+    jobs, internships, total_sources, new_seen_hashes = fetch_all()
 
     if not jobs and not internships:
         log.info("No new listings found in this cycle. Skipping email send.")
@@ -1069,9 +1208,15 @@ def main() -> None:
     html = build_html_email(jobs, internships, total_sources)
     success = send_email(html, jobs, internships)
     if success:
+        # Save the new seen jobs only after successful email send
+        seen_past = load_seen_jobs()
+        seen_past.update(new_seen_hashes)
+        save_seen_jobs(seen_past)
         log.info("Run finished successfully with email delivered! 🎉")
     else:
-        log.info("Run finished! (Fetched %d jobs, %d internships across %d sources) 🎉", len(jobs), len(internships), total_sources)
+        log.error("Failed to send email. Not updating seen_jobs.json.")
+        # Exit with non-zero to indicate failure
+        sys.exit(1)
 
 
 if __name__ == "__main__":

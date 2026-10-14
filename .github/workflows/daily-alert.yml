@@ -17,6 +17,8 @@ jobs:
   send-alert:
     name: Fetch Jobs & Send Digest Email
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       # ── 1. Check out the repository ───────────────────────
@@ -24,13 +26,13 @@ jobs:
         uses: actions/checkout@v4
 
       # ── 2. Restore seen_jobs.json from cache ──────────────
-      # This preserves deduplication state across runs so the
-      # same jobs are not emailed repeatedly.
+      # Uses run_id in the primary key to ensure cache saves a fresh entry
+      # on every run, while falling back to the latest prefix.
       - name: Restore seen_jobs cache
         uses: actions/cache@v4
         with:
           path: seen_jobs.json
-          key: seen-jobs-${{ runner.os }}
+          key: seen-jobs-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
             seen-jobs-${{ runner.os }}-
             seen-jobs-
@@ -48,7 +50,7 @@ jobs:
 
       # ── 5. Run the alert script ───────────────────────────
       # Secrets are injected as environment variables.
-      # Set these in your repo → Settings → Secrets → Actions
+      # If sending fails, the script exits with non-zero status.
       - name: Run job alert
         env:
           EMAIL_FROM:      ${{ secrets.EMAIL_FROM }}
@@ -57,4 +59,19 @@ jobs:
           KEYWORDS:        ${{ secrets.KEYWORDS }}
           ENABLE_LINKEDIN: ${{ secrets.ENABLE_LINKEDIN || vars.ENABLE_LINKEDIN || 'false' }}
         run: python job_alert.py
+
+      # ── 6. Commit and push updated seen_jobs.json ─────────
+      # Persists deduplication state directly in the repository so
+      # state is never lost even if cache expires.
+      - name: Commit and push updated seen_jobs.json
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_jobs.json
+          if git diff --staged --quiet; then
+            echo "No changes in seen_jobs.json to commit."
+          else
+            git commit -m "chore: update seen_jobs.json [skip ci]"
+            git push
+          fi
 

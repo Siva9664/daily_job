@@ -176,7 +176,7 @@ daily-job-internship-alerts/
 ├── source_manager.py         ← Source loader, merger & filter logic
 ├── custom_sources.json       ← 🎛️ User custom sources & interested-only config
 ├── custom_sources.py         ← Alternative Python format for custom sources
-├── requirements.txt          ← 2 pip packages: requests, python-dotenv
+├── requirements.txt          ← 3 pip packages: requests, python-dotenv, beautifulsoup4
 │
 ├── .env.example              ← Template — copy to .env and fill in values
 ├── .env                      ← Your local secrets (gitignored!)
@@ -221,7 +221,7 @@ source .venv/bin/activate        # macOS / Linux
 .venv\Scriptsctivate           # Windows (cmd)
 .venv\Scripts\Activate.ps1       # Windows (PowerShell)
 
-# Install the 2 required packages
+# Install the 3 required packages
 pip install -r requirements.txt
 ```
 
