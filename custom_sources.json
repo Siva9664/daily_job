@@ -26,6 +26,72 @@
       "ats": "ashby",
       "token": "linear",
       "enabled": true
+    },
+    {
+      "name": "Anthropic",
+      "ats": "greenhouse",
+      "token": "anthropic",
+      "enabled": true
+    },
+    {
+      "name": "Perplexity",
+      "ats": "greenhouse",
+      "token": "perplexity",
+      "enabled": true
+    },
+    {
+      "name": "Cohere",
+      "ats": "greenhouse",
+      "token": "cohere",
+      "enabled": true
+    },
+    {
+      "name": "Mistral",
+      "ats": "greenhouse",
+      "token": "mistral",
+      "enabled": true
+    },
+    {
+      "name": "Together AI",
+      "ats": "greenhouse",
+      "token": "together_ai",
+      "enabled": true
+    },
+    {
+      "name": "Scale AI",
+      "ats": "lever",
+      "token": "scale_ai",
+      "enabled": true
+    },
+    {
+      "name": "Databricks",
+      "ats": "greenhouse",
+      "token": "databricks",
+      "enabled": true
+    },
+    {
+      "name": "Weights & Biases",
+      "ats": "lever",
+      "token": "wandb",
+      "enabled": true
+    },
+    {
+      "name": "Cursor",
+      "ats": "greenhouse",
+      "token": "cursor",
+      "enabled": true
+    },
+    {
+      "name": "Notion",
+      "ats": "ashby",
+      "token": "notion",
+      "enabled": true
+    },
+    {
+      "name": "Figma",
+      "ats": "greenhouse",
+      "token": "figma",
+      "enabled": true
     }
   ],
   "custom_feeds": [

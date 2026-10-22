@@ -1,5 +1,5 @@
 """Regression tests for daily-job-internship-alerts.
-
+https://github.com/kruthikpranavtr/DRAFT_AI_CLUB_WEBSITE.git
 Covers defects found during live verification (2026-10-14):
  1. job_alert.py must compile (IndentationError in fetch_remoteok/fetch_arbeitnow).
  2. posted_ts must always be numeric (ATS ISO strings broke recency ordering).
@@ -16,7 +16,7 @@ import sys
 REPO = pathlib.Path("/home/shiva/Projects/daily-job-internship-alerts")
 
 
-def load_job_alert():
+https://github.com/kruthikpranavtr/DRAFT_AI_CLUB_WEBSITE.gitdef load_job_alert():
     sys.path.insert(0, str(REPO))
     spec = importlib.util.spec_from_file_location("job_alert", REPO / "job_alert.py")
     mod = importlib.util.module_from_spec(spec)
