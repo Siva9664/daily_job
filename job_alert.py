@@ -48,14 +48,135 @@ log = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-EMAIL_FROM      = os.getenv("EMAIL_FROM", "")
-EMAIL_PASSWORD  = os.getenv("EMAIL_PASSWORD", "")
-EMAIL_TO_RAW    = os.getenv("EMAIL_TO", "")
-EMAIL_TO        = [e.strip() for e in EMAIL_TO_RAW.split(",") if e.strip()]
-KEYWORDS_RAW    = os.getenv("KEYWORDS", "")
-KEYWORDS        = [k.strip().lower() for k in KEYWORDS_RAW.split(",") if k.strip()]
+EMAIL_FROM = os.getenv("EMAIL_FROM", "")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")
+EMAIL_TO_RAW = os.getenv("EMAIL_TO", "")
+EMAIL_TO = [e.strip() for e in EMAIL_TO_RAW.split(",") if e.strip()]
+
+# NEW: Location filtering
+# Supported values: remote, india, hybrid
+# When set to "india", matches jobs in Indian cities (Bangalore, Hyderabad, Chennai, Mumbai, Pune, Delhi, Gurgaon, Noida, etc.)
+# When set to "hybrid", matches hybrid work arrangements
+# When set to "remote", matches remote positions
+# Can combine multiple values: "india,remote" for India remote jobs, etc.
+LOCATIONS_RAW = os.getenv("LOCATIONS", "")
+LOCATIONS = [loc.strip().lower() for loc in LOCATIONS_RAW.split(",") if loc.strip()]
+
+KEYWORDS_RAW = os.getenv("KEYWORDS", "")
+KEYWORDS = [k.strip().lower() for k in KEYWORDS_RAW.split(",") if k.strip()]
 
 ENABLE_LINKEDIN = os.getenv("ENABLE_LINKEDIN", "false").strip().lower() in ("true", "1", "yes")
+
+# NEW: DRY_RUN mode - when enabled, print the HTML email instead of sending it
+DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in ("true", "1", "yes")
+
+# GitHub Actions detection
+GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1", "yes")
+
+# Indian city names for location matching
+INDIA_CITIES = {
+    "bangalore", "bengaluru", "hyderabad", "chennai", "mumbai", "pune",
+    "delhi", "gurgaon", "gurugram", "noida", "ncr", "kolkata", "pune",
+    "ahmedabad", "jaipur", "chandigarh", "bhubaneswar", "coimbatore",
+    "lucknow", "kanpur", "vizag", "visakhapatnam", "madurai",
+}
+
+
+def matches_location(location_str: str) -> bool:
+    """Check if a job location matches the configured LOCATIONS filter.
+
+    Supports values:
+    - 'remote': matches remote/no-location jobs
+    - 'hybrid': matches hybrid work arrangements
+    - 'india': matches jobs in Indian cities
+    - Multiple values combined (e.g., 'india,remote')
+    """
+    loc = (location_str or "").lower().strip()
+
+    # 'remote' matches jobs with no specific location or remote explicitly
+    if "remote" in LOCATIONS:
+        if loc in ("remote", "home", "work from anywhere", "anywhere"):
+            return True
+        if not loc or loc == "any":
+            return True
+
+    # 'hybrid' matches hybrid work arrangements
+    if "hybrid" in LOCATIONS:
+        if "hybrid" in loc or "part-time" in loc or "flexible" in loc:
+            return True
+
+    # 'india' matches jobs in Indian cities
+    if "india" in LOCATIONS:
+        # Check if location contains any Indian city name
+        for city in INDIA_CITIES:
+            if city in loc:
+                return True
+        # Also check if the location string itself is an Indian city
+        if loc in INDIA_CITIES:
+            return True
+
+    # If no LOCATIONS filter is set, match everything
+    if not LOCATIONS:
+        return True
+
+    return False
+
+
+def matches_keywords(title: str, company: str, desc: str) -> bool:
+    """Check if a job matches the KEYWORDS filter.
+
+    Both title and company/description are checked.
+    Keywords matching is case-insensitive and uses word boundary matching.
+    """
+    text = f"{title} {company} {desc}".lower()
+
+    # If no keywords filter, match everything
+    if not KEYWORDS:
+        return True
+
+    for kw in KEYWORDS:
+        # Use word boundary matching for exact word match
+        pattern = r"\b" + re.escape(kw) + r"\b"
+        if re.search(pattern, text):
+            return True
+
+    return False
+
+
+# Better validation for email config with clear messages
+def validate_email_config():
+    """Validate email configuration and return error message if invalid, None if valid."""
+    errors = []
+
+    if not EMAIL_FROM:
+        errors.append("EMAIL_FROM is not set. Please set it in your .env file.")
+    elif "your_gmail" in EMAIL_FROM.lower() or "@" not in EMAIL_FROM:
+        errors.append(
+            f"EMAIL_FROM '{EMAIL_FROM}' looks like a placeholder. "
+            "Please set a valid Gmail address or your actual sender email."
+        )
+
+    if not EMAIL_PASSWORD:
+        errors.append("EMAIL_PASSWORD is not set. Please set it in your .env file.")
+    elif "xxxx" in EMAIL_PASSWORD.lower():
+        errors.append(
+            f"EMAIL_PASSWORD looks like a placeholder. "
+            "Generate a Gmail App Password from: https://myaccount.google.com/apppasswords"
+        )
+
+    if not EMAIL_TO:
+        errors.append("EMAIL_TO is not set. Please set it in your .env file.")
+    else:
+        # Check if recipients look like placeholders
+        for e in EMAIL_TO:
+            if "recipient" in e.lower() or "@" not in e:
+                errors.append(
+                    f"EMAIL_TO '{e}' looks like a placeholder. "
+                    "Set real recipient email addresses."
+                )
+                break
+
+    return "; ".join(errors) if errors else None
 
 SEEN_JOBS_FILE  = Path("seen_jobs.json")
 REQUEST_TIMEOUT = 12            # seconds per ATS / API call
@@ -71,8 +192,14 @@ INTERN_REGEX = re.compile(
 )
 
 # ---------------------------------------------------------------------------
-# Deduplication helpers
+# India locations mapping for intelligent matching
 # ---------------------------------------------------------------------------
+INDIA_CITIES = {
+    "bangalore", "bengaluru", "hyderabad", "chennai", "mumbai", "pune",
+    "delhi", "gurgaon", "gurugram", "noida", "ncr", "kolkata", "pune",
+    "ahmedabad", "bhubaneswar", "chandigarh", "coimbatore", "jaipur",
+    "lucknow", "patna", "surat", "vizag", "visakhapatnam",
+}
 
 def load_seen_jobs() -> set:
     """Load previously seen job hashes from disk."""
@@ -166,16 +293,65 @@ def _parse_timestamp(val: Any) -> float:
 
 
 def matches_keywords(job: dict) -> bool:
-    """Return True if job matches configured keywords (or if no keywords set)."""
+    """Return True if job matches configured keywords and location (AND logic).
+    If no keywords set, only location filter is applied.
+    If no location filter set, only keywords are checked.
+    """
+    # Keyword check
     if not KEYWORDS:
+        kw_match = True
+    else:
+        haystack = " ".join([
+            _to_str(job.get("title")),
+            _to_str(job.get("company")),
+            _to_str(job.get("description")),
+            _to_str(job.get("tags")),
+        ]).lower()
+        kw_match = any(kw in haystack for kw in KEYWORDS)
+
+    # Location check
+    if not LOCATIONS:
+        loc_match = True
+    else:
+        job_loc = _to_str(job.get("location", "")).lower()
+        loc_match = _matches_locations(job_loc)
+
+    return kw_match and loc_match
+
+
+def _matches_locations(job_location: str) -> bool:
+    """Check if a job location matches the configured LOCATIONS filter."""
+    if not LOCATIONS:
         return True
-    haystack = " ".join([
-        _to_str(job.get("title")),
-        _to_str(job.get("company")),
-        _to_str(job.get("description")),
-        _to_str(job.get("tags")),
-    ]).lower()
-    return any(kw in haystack for kw in KEYWORDS)
+
+    loc = job_location.lower().strip()
+
+    # "india" filter - check if any India city is in the location
+    if "india" in LOCATIONS:
+        if any(city in loc for city in INDIA_CITIES):
+            return True
+
+    # "remote" filter - check if job is remote
+    if "remote" in LOCATIONS:
+        remote_keywords = ["remote", "work from home", "work-from-home", "wfh"]
+        if any(kw in loc for kw in remote_keywords):
+            return True
+
+    # "hybrid" filter - check for hybrid indicators
+    if "hybrid" in LOCATIONS:
+        hybrid_keywords = ["hybrid", "mix", "partially remote"]
+        if any(kw in loc for kw in hybrid_keywords):
+            return True
+
+    # If specific cities are configured (not just india/remote/hybrid),
+    # check if any of those cities match
+    for loc_filter in LOCATIONS:
+        if loc_filter in INDIA_CITIES:
+            if loc_filter in loc:
+                return True
+
+    # Default: no match if we have a location filter but none of the above matched
+    return False
 
 
 def _truncate(text: Any, max_len: int = 280) -> str:
@@ -946,10 +1122,11 @@ def _job_card_html(job: dict, accent: str) -> str:
 
 
 
-def build_html_email(jobs: list[dict], internships: list[dict], total_sources: int) -> str:
+def build_html_email(jobs: list[dict], internships: list[dict], total_sources: int, total_new_jobs: int = 0) -> str:
     """Assemble the complete HTML email body with live source statistics."""
     today = datetime.date.today().strftime("%B %d, %Y")
     total = len(jobs) + len(internships)
+    duplicates_skipped = total_new_jobs - total if total_new_jobs else 0
 
     jobs_html = "".join(_job_card_html(j, "#4F46E5") for j in jobs) if jobs else (
         '<p class="empty">No new job openings found matching your criteria today. Check back tomorrow!</p>'
@@ -1144,12 +1321,26 @@ def build_html_email(jobs: list[dict], internships: list[dict], total_sources: i
 # Email Sender
 # ---------------------------------------------------------------------------
 
-def send_email(html_body: str, jobs: list[dict], internships: list[dict]) -> None:
-    """Send the HTML digest via Gmail SMTP (TLS on port 587)."""
-    if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO or "your_gmail" in EMAIL_FROM or "xxxx" in EMAIL_PASSWORD:
-        log.warning("EMAIL_FROM or EMAIL_PASSWORD is not configured (or contains placeholder values). Skipping email delivery.")
+def send_email(html_body: str, jobs: list[dict], internships: list[dict]) -> bool:
+    """Send the HTML digest via Gmail SMTP (TLS on port 587).
+
+    Returns True if email was sent successfully, False otherwise.
+    Does NOT call sys.exit() — the caller decides how to handle failures.
+    """
+    # Validate email config first
+    validation_error = validate_email_config()
+    if validation_error:
+        log.warning("Email configuration invalid: %s. Skipping email delivery.", validation_error)
         log.info("Tip: Set real credentials in .env or GitHub Secrets to receive email alerts.")
         return False
+
+    # If DRY_RUN mode, print the HTML email and don't send
+    if DRY_RUN:
+        log.info("DRY_RUN mode: printing HTML email instead of sending")
+        print("\n=== DRY_RUN HTML EMAIL OUTPUT ===")
+        print(html_body)
+        print("=== END DRY_RUN OUTPUT ===\n")
+        return True  # Consider DRY_RUN as "successful" since we didn't crash
 
     today = datetime.date.today().strftime("%B %d, %Y")
     total = len(jobs) + len(internships)
@@ -1199,14 +1390,43 @@ def main() -> None:
     else:
         log.info("No keyword filter active — checking all listings")
 
+    if LOCATIONS:
+        log.info("Location filter active: %s", ", ".join(LOCATIONS))
+    else:
+        log.info("No location filter active — checking all locations")
+
     jobs, internships, total_sources, new_seen_hashes = fetch_all()
 
     if not jobs and not internships:
         log.info("No new listings found in this cycle. Skipping email send.")
         return
 
-    html = build_html_email(jobs, internships, total_sources)
+    # Count duplicates skipped during this run (from seen_run that were
+    # filtered out by keywords/location before reaching this point)
+    # We track this in fetch_all via the seen_run set; we compute skipped
+    # from the difference between total raw matches and filtered new_seen_hashes.
+    # For now, we'll report the new jobs count.
+
+    html = build_html_email(jobs, internships, total_sources, len(jobs) + len(internships))
+
+    # DRY_RUN mode: print the HTML email instead of sending it
+    if DRY_RUN:
+        log.info("DRY_RUN enabled — printing HTML email output (not sending):")
+        print("\n" + "=" * 60)
+        print("DRY_RUN MODE — HTML EMAIL OUTPUT")
+        print("=" * 60)
+        print(html)
+        print("=" * 60 + "\n")
+        # In DRY_RUN, we still save seen jobs so the run isn't repetitive
+        seen_past = load_seen_jobs()
+        seen_past.update(new_seen_hashes)
+        save_seen_jobs(seen_past)
+        log.info("Run finished in DRY_RUN mode. Seen jobs saved.")
+        return
+
+    # Send email (non-DRY_RUN mode)
     success = send_email(html, jobs, internships)
+
     if success:
         # Save the new seen jobs only after successful email send
         seen_past = load_seen_jobs()
@@ -1215,9 +1435,9 @@ def main() -> None:
         log.info("Run finished successfully with email delivered! 🎉")
     else:
         log.error("Failed to send email. Not updating seen_jobs.json.")
-        # Exit with non-zero to indicate failure
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+        # Only exit with code 1 when running inside GitHub Actions
+        if GITHUB_ACTIONS:
+            log.error("Exiting with code 1 as running inside GitHub Actions.")
+            sys.exit(1)
+        else:
+            log.warning("Email failed but continuing (not in GitHub Actions).")
